@@ -5,7 +5,7 @@ import re
 import SQL_connection
 import sqlalchemy
 import pymysql
-
+from config import WEATHER_API_KEY
 
 def dms_to_decimal(dms_str):
     # Extract degrees, minutes, seconds, and direction
@@ -103,6 +103,40 @@ def push_to_my_sql(df, table_name, connection_string = SQL_connection.get_sql_co
            con=connection_string,
            index=False)
 
+
+def get_weather_data(lat, lon):
+    weather_json = requests.get(
+        f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric")
+    weather_json = weather_json.json()
+
+    # Create empty lists for collecting data
+    dates = []
+    temperatures = []
+    weather_descriptions = []
+    rain_values = []
+
+    # Extract data from each forecast element
+    for element in weather_json['list']:
+        dates.append(element['dt_txt'])
+        temperatures.append(element['main']['temp'])
+        weather_descriptions.append(element['weather'][0]['description'])
+
+        # Check if rain data exists and extract it
+        if 'rain' in element and '3h' in element['rain']:
+            rain_values.append(element['rain']['3h'])
+        else:
+            rain_values.append(0)
+
+    # Create DataFrame from the collected data
+    df = pd.DataFrame({
+        'date': dates,
+        'temperature': temperatures,
+        'weather': weather_descriptions,
+        'rain': rain_values
+    })
+
+    return df
+
 city_names_df = ["Berlin", "Hamburg", "Munich", "Santiago", "Paris", "Beijing", "New_York_City"]
 cities_df = crawl_data(city_names_df)
 
@@ -132,3 +166,44 @@ cities_df_sqled = cities_df_sqled.drop(columns=["city_name", "country", "latitud
 # Push the updated table to the city_data SQL table
 push_to_my_sql(cities_df_sqled, 'city_data')
 
+# Get weather data for cities
+cities_df = pd.read_sql('city_data', con=connection_string)
+
+# List to collect all weather data
+all_weather_data = []
+
+# Iterate through city rows
+for index, city in cities_df.iterrows():
+    try:
+        lat = city['latitude_decimal']
+        lon = city['longitude_decimal']
+
+        # Get weather data for this city
+        city_weather = get_weather_data(lat, lon)
+
+        # Add city_id to each weather row
+        city_weather['city_id'] = city['city_id']
+
+        # Append to our list of DataFrames
+        all_weather_data.append(city_weather)
+
+        print(f"Successfully retrieved weather data for city ID {city['city_id']}")
+
+    except Exception as e:
+        print(f"Error retrieving weather data for city ID {city['city_id']}: {str(e)}")
+
+# Check if we have any successful weather data
+if all_weather_data:
+    # Combine all weather data into one DataFrame
+    weather_df = pd.concat(all_weather_data, ignore_index=True)
+
+    # Reorder columns to put city_id first
+    weather_df = weather_df[['city_id', 'date', 'temperature', 'weather', 'rain']]
+
+    print(f"Total weather entries collected: {len(weather_df)}")
+    print(weather_df.head())
+
+    # Optionally, save to database
+    push_to_my_sql(weather_df, 'weather_data')
+else:
+    print("No weather data was collected.")
