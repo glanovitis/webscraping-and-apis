@@ -5,7 +5,89 @@ import re
 import SQL_connection
 import sqlalchemy
 import pymysql
-from config import WEATHER_API_KEY
+from config import WEATHER_API_KEY, FLIGHTS_API_KEY
+from datetime import datetime, timezone
+import dateutil.parser
+
+
+def convert_dates_for_sql(df, date_columns=None, target_format='%Y-%m-%d %H:%M:%S', to_utc=True):
+    """
+    Convert date strings in various formats to SQL-compatible format.
+
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The dataframe containing date columns
+    date_columns : list, optional
+        List of column names to process. If None, will attempt to detect date columns.
+    target_format : str, optional
+        The target date format for SQL
+    to_utc : bool, optional
+        Whether to convert all dates to UTC time
+
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame with converted date columns
+    """
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # If date_columns not provided, try to detect them
+    if date_columns is None:
+        date_columns = []
+        date_pattern = re.compile(r'\d{4}-\d{2}-\d{2}')
+
+        for col in df.columns:
+            # Skip non-string columns
+            if df[col].dtype != 'object':
+                continue
+
+            # Check if column has date-like strings
+            sample_values = df[col].dropna().head(10).astype(str)
+            if any(date_pattern.search(val) for val in sample_values):
+                date_columns.append(col)
+
+    # Process each date column
+    for col in date_columns:
+        result_df[col] = result_df[col].apply(
+            lambda x: format_date_for_sql(x, target_format, to_utc) if pd.notna(x) else x
+        )
+
+    return result_df
+
+
+def format_date_for_sql(date_string, target_format='%Y-%m-%d %H:%M:%S', to_utc=True):
+    """
+    Parse a date string with timezone and convert to SQL format.
+
+    Parameters:
+    -----------
+    date_string : str
+        The date string to convert
+    target_format : str
+        The target date format for SQL
+    to_utc : bool
+        Whether to convert to UTC time
+
+    Returns:
+    --------
+    str
+        Formatted date string for SQL
+    """
+    try:
+        # Parse the date string with timezone information
+        dt = dateutil.parser.parse(date_string)
+
+        # Convert to UTC if required
+        if to_utc and dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc)
+
+        # Format to target format (removing timezone info)
+        return dt.strftime(target_format)
+    except (ValueError, TypeError):
+        # Return original value if parsing fails
+        return date_string
 
 def dms_to_decimal(dms_str):
     # Extract degrees, minutes, seconds, and direction
@@ -103,7 +185,6 @@ def push_to_my_sql(df, table_name, connection_string = SQL_connection.get_sql_co
            con=connection_string,
            index=False)
 
-
 def get_weather_data(lat, lon):
     weather_json = requests.get(
         f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric")
@@ -137,6 +218,138 @@ def get_weather_data(lat, lon):
 
     return df
 
+def push_weather_to_sql(connection_string = SQL_connection.get_sql_connection()):
+    cities_df = pd.read_sql('city_data', con=connection_string)
+
+    # List to collect all weather data
+    all_weather_data = []
+    # Iterate through city rows
+    for index, city in cities_df.iterrows():
+        try:
+            lat = city['latitude_decimal']
+            lon = city['longitude_decimal']
+
+            # Get weather data for this city
+            city_weather = get_weather_data(lat, lon)
+
+            # Add city_id to each weather row
+            city_weather['city_id'] = city['city_id']
+
+            # Append to our list of DataFrames
+            all_weather_data.append(city_weather)
+
+            print(f"Successfully retrieved weather data for city ID {city['city_id']}")
+
+        except Exception as e:
+            print(f"Error retrieving weather data for city ID {city['city_id']}: {str(e)}")
+
+    # Check if we have any successful weather data
+    if all_weather_data:
+        # Combine all weather data into one DataFrame
+        weather_df = pd.concat(all_weather_data, ignore_index=True)
+
+        # Reorder columns to put city_id first
+        weather_df = weather_df[['city_id', 'date', 'temperature', 'weather', 'rain']]
+
+        print(f"Total weather entries collected: {len(weather_df)}")
+        print(weather_df.head())
+
+        # Save to database
+        push_to_my_sql(weather_df, 'weather_data')
+    else:
+        print("No weather data was collected.")
+
+
+def get_flights_data(connection_string = SQL_connection.get_sql_connection()):
+    cities_df = pd.read_sql('city_data', con=connection_string)
+
+    querystring = {"withFlightInfoOnly": "true"}
+    headers = {
+        "X-RapidAPI-Key": FLIGHTS_API_KEY,
+        "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"
+    }
+
+    # List to collect all weather data
+    all_airports = pd.DataFrame()
+
+    for index, city in cities_df.iterrows():
+        try:
+            lat = city['latitude_decimal']
+            lon = city['longitude_decimal']
+            url = f"https://aerodatabox.p.rapidapi.com/airports/search/location/{lat}/{lon}/km/50/16"
+            response = requests.get(url, headers=headers, params=querystring)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                # Get the keys from the first item (if available)
+                if data.get('items') and len(data.get('items')) > 0:
+                    # Print the keys of the first item
+                    first_item_keys = data['items'][0].keys()
+
+                # Convert JSON to DataFrame for this city
+                airports = pd.json_normalize(data.get('items', []))
+
+                # Add the city_id to every row in the airports DataFrame
+                if not airports.empty:
+                    airports['city_id'] = city['city_id']
+
+                # Append to the main DataFrame, not to a list
+                all_airports = pd.concat([all_airports, airports], ignore_index=True)
+            else:
+                print(f"Error status code: {response.status_code}")
+
+        except Exception as e:
+            print(f"Error retrieving data for city ID {city['city_id']}: {str(e)}")
+
+    print(all_airports.columns)
+    all_departures = pd.DataFrame()
+    all_arrivals = pd.DataFrame()
+    for index, airport in all_airports.iterrows():
+        # access DataFrame column values
+        iata = airport['iata']
+        url = f'https://aerodatabox.p.rapidapi.com/flights/airports/iata/{iata}?offsetMinutes=-120&durationMinutes=720&withLeg=true&direction=Both&withCancelled=true&withCodeshared=true&withCargo=false&withPrivate=true&withLocation=false'
+        response = requests.get(url, headers=headers, params=querystring)
+        if response.status_code == 200:
+            data = response.json()
+            departures = pd.json_normalize(data.get('departures', []))
+            arrivals = pd.json_normalize(data.get('arrivals', []))
+            departures['iata'] = airport['iata']
+            arrivals['iata'] = airport['iata']
+            all_departures = pd.concat([all_departures, departures], ignore_index=True)
+            all_arrivals = pd.concat([all_arrivals, arrivals], ignore_index=True)
+
+    cols_to_drop_all_departures = ['codeshareStatus', 'isCargo', 'departure.runwayTime.utc',
+                                           'departure.runwayTime.local', 'departure.terminal', 'departure.checkInDesk', 'departure.gate',
+                                           'departure.runway', 'departure.quality', 'arrival.airport.icao',
+                                           'arrival.airport.iata', 'arrival.airport.name',
+                                           'arrival.airport.timeZone', 'arrival.scheduledTime.utc',
+                                           'arrival.scheduledTime.local', 'arrival.revisedTime.utc',
+                                           'arrival.revisedTime.local', 'arrival.terminal', 'arrival.gate',
+                                           'arrival.quality', 'aircraft.reg', 'aircraft.modeS', 'aircraft.model',
+                                           'airline.name', 'airline.iata', 'airline.icao', 'arrival.baggageBelt',
+                                           'arrival.runwayTime.utc', 'arrival.runwayTime.local', 'arrival.runway']
+    cols_to_drop_filtered = [col for col in cols_to_drop_all_departures if col in all_departures.columns]
+    all_departures = all_departures.drop(cols_to_drop_filtered, axis=1)
+    cols_to_drop_all_arrivals = ['codeshareStatus', 'isCargo',
+                                       'departure.airport.icao', 'departure.airport.iata',
+                                       'departure.airport.name', 'departure.airport.timeZone',
+                                       'departure.terminal', 'departure.quality','arrival.baggageBelt', 'arrival.runway', 'arrival.quality',
+                                       'aircraft.reg', 'aircraft.modeS', 'aircraft.model', 'airline.name',
+                                       'airline.iata', 'airline.icao', 'departure.checkInDesk',
+                                       'departure.gate', 'departure.runway']
+    cols_to_drop_arrivals_filtered = [col for col in cols_to_drop_all_arrivals if col in all_arrivals.columns]
+    all_arrivals = all_arrivals.drop(cols_to_drop_arrivals_filtered, axis=1)
+    all_airports = all_airports.rename(columns=lambda x: x.replace('.', '_'))
+    all_departures = all_departures.rename(columns=lambda x: x.replace('.', '_'))
+    all_arrivals = all_arrivals.rename(columns=lambda x: x.replace('.', '_'))
+    push_to_my_sql(all_airports, 'airports')
+    push_to_my_sql(all_departures, 'departures')
+    push_to_my_sql(all_arrivals, 'arrivals')
+
+
+
+
 city_names_df = ["Berlin", "Hamburg", "Munich", "Santiago", "Paris", "Beijing", "New_York_City"]
 cities_df = crawl_data(city_names_df)
 
@@ -167,43 +380,5 @@ cities_df_sqled = cities_df_sqled.drop(columns=["city_name", "country", "latitud
 push_to_my_sql(cities_df_sqled, 'city_data')
 
 # Get weather data for cities
-cities_df = pd.read_sql('city_data', con=connection_string)
-
-# List to collect all weather data
-all_weather_data = []
-
-# Iterate through city rows
-for index, city in cities_df.iterrows():
-    try:
-        lat = city['latitude_decimal']
-        lon = city['longitude_decimal']
-
-        # Get weather data for this city
-        city_weather = get_weather_data(lat, lon)
-
-        # Add city_id to each weather row
-        city_weather['city_id'] = city['city_id']
-
-        # Append to our list of DataFrames
-        all_weather_data.append(city_weather)
-
-        print(f"Successfully retrieved weather data for city ID {city['city_id']}")
-
-    except Exception as e:
-        print(f"Error retrieving weather data for city ID {city['city_id']}: {str(e)}")
-
-# Check if we have any successful weather data
-if all_weather_data:
-    # Combine all weather data into one DataFrame
-    weather_df = pd.concat(all_weather_data, ignore_index=True)
-
-    # Reorder columns to put city_id first
-    weather_df = weather_df[['city_id', 'date', 'temperature', 'weather', 'rain']]
-
-    print(f"Total weather entries collected: {len(weather_df)}")
-    print(weather_df.head())
-
-    # Optionally, save to database
-    push_to_my_sql(weather_df, 'weather_data')
-else:
-    print("No weather data was collected.")
+push_weather_to_sql()
+get_flights_data()
